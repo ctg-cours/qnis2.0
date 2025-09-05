@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calculateur d'Intérêts Juridiques</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { theme: { extend: { colors: { 'brand-primary': '#1e40af', 'brand-secondary': '#3b82f6', 'brand-light': '#dbeafe', 'brand-dark': '#1e3a8a' } } } }
+    </script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { background-color: #f0f4f8; }
+        @media print { .no-export { display: none !important; } body { -webkit-print-color-adjust: exact; color-adjust: exact; } thead { display: table-header-group; } tr { page-break-inside: avoid; } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel" data-presets="react,typescript">
+// --- BUNDLE START ---
+
+// --- Dependencies ---
+const { useState, useEffect } = React;
+const { createRoot } = ReactDOM;
+const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
+
+// --- constants.js ---
+const REFERENCE_RATES = [
+  { startDate: "1990-01-01", rate: 0.0931 }, { startDate: "1995-01-01", rate: 0.0727 },
+  { startDate: "1996-07-01", rate: 0.0575 }, { startDate: "2000-01-01", rate: 0.0426 },
+  { startDate: "2002-01-01", rate: 0.0329 }, { startDate: "2003-01-01", rate: 0.0227 },
+  { startDate: "2004-01-01", rate: 0.0205 }, { startDate: "2005-01-01", rate: 0.0227 },
+  { startDate: "2006-01-01", rate: 0.0303 }, { startDate: "2009-01-01", rate: 0.0121 },
+  { startDate: "2010-01-01", rate: 0.0065 }, { startDate: "2011-01-01", rate: 0.0040 },
+  { startDate: "2013-01-01", rate: 0.0004 }, { startDate: "2015-01-01", rate: 0.0099 },
+];
+
+// --- services/calculationService.js ---
+function parseUTCDate(dateString) {
+    return new Date(`${dateString}T00:00:00Z`);
+}
+function addUTCDays(date, days) {
+    const newDate = new Date(date.getTime());
+    newDate.setUTCDate(newDate.getUTCDate() + days);
+    return newDate;
+}
+function diffInDays(date1, date2) {
+    const oneDay = 1000 * 60 * 60 * 24;
+    const diffTime = date2.getTime() - date1.getTime();
+    return Math.round(diffTime / oneDay);
+}
+function findRateForDate(date) {
+    let applicableRate = 0;
+    for (const rateInfo of REFERENCE_RATES) {
+        if (parseUTCDate(rateInfo.startDate) <= date) {
+            applicableRate = rateInfo.rate;
+        } else {
+            break;
+        }
+    }
+    return applicableRate;
+}
+function applyLegalMention(rate, legalMention) {
+    let modifiedRate = rate;
+    if (legalMention.includes("majoré de moitié")) {
+        modifiedRate *= 1.5;
+    }
+    if (legalMention.includes("+2%")) {
+        modifiedRate += 0.02;
+    }
+    return modifiedRate;
+}
+function calculateCompoundInterest(inputs) {
+    const { principal, calculationStartDate, calculationEndDate, legalMention } = inputs;
+    const startDate = parseUTCDate(calculationStartDate);
+    const endDate = parseUTCDate(calculationEndDate);
+    if (startDate >= endDate) {
+        throw new Error("La date de fin doit être postérieure à la date de début.");
+    }
+    let currentPrincipal = principal;
+    let currentDate = startDate;
+    const steps = [];
+    while (currentDate <= endDate) {
+        const baseRate = findRateForDate(currentDate);
+        const actualRate = applyLegalMention(baseRate, legalMention);
+        let segmentEndDate = endDate;
+        for (const rateInfo of REFERENCE_RATES) {
+            const rateChangeDate = parseUTCDate(rateInfo.startDate);
+            if (rateChangeDate > currentDate) {
+                const dayBeforeRateChange = addUTCDays(rateChangeDate, -1);
+                if (dayBeforeRateChange < segmentEndDate) {
+                    segmentEndDate = dayBeforeRateChange;
+                }
+                break;
+            }
+        }
+        if (segmentEndDate > endDate) {
+            segmentEndDate = endDate;
+        }
+        const daysInSegment = diffInDays(currentDate, segmentEndDate) + 1;
+        if (daysInSegment <= 0) {
+            break;
+        }
+        const interest = currentPrincipal * actualRate * (daysInSegment / 365.25);
+        steps.push({
+            periodStart: currentDate.toISOString().split('T')[0],
+            periodEnd: segmentEndDate.toISOString().split('T')[0],
+            days: daysInSegment,
+            rate: actualRate,
+            principalStart: currentPrincipal,
+            interest: interest,
+        });
+        currentPrincipal += interest;
+        currentDate = addUTCDays(segmentEndDate, 1);
+    }
+    const totalInterest = currentPrincipal - principal;
+    return {
+        steps,
+        initialPrincipal: principal,
+        finalPrincipal: currentPrincipal,
+        totalInterest,
+        inputs,
+    };
+}
+
+// --- components/History.js ---
+const History = ({ history, onLoad, onDelete }) => {
+    const formatCurrency = (value) => new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'XOF' }).format(value);
+    const formatDate = (dateString) => {
+        const date = new Date(dateString);
+        return new Intl.DateTimeFormat('fr-FR', { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+    };
+    if (history.length === 0) {
+        return (
+            <div className="bg-white p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-bold text-brand-dark mb-4">Historique des Calculs</h2>
+                <p className="text-gray-500">Aucun calcul n'a été sauvegardé pour le moment.</p>
+            </div>
+        );
+    }
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg">
+            <h2 className="text-2xl font-bold text-brand-dark mb-4">Historique des Calculs</h2>
+            <div className="space-y-4">
+                {history.map((item) => (
+                    <div key={item.id} className="border border-gray-200 rounded-lg p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 hover:bg-gray-50 transition">
+                        <div className="flex-grow">
+                            <p className="font-bold text-lg text-brand-primary">{item.name}</p>
+                            <p className="text-sm text-gray-500">Sauvegardé le: {formatDate(item.savedAt)}</p>
+                            <div className="text-sm text-gray-700 mt-2 flex flex-wrap gap-x-4 gap-y-1">
+                                <span>Principal: <span className="font-semibold">{formatCurrency(item.calculation.initialPrincipal)}</span></span>
+                                <span>Intérêts (HT): <span className="font-semibold">{formatCurrency(item.calculation.totalInterest)}</span></span>
+                                <span>Final: <span className="font-semibold">{formatCurrency(item.calculation.finalPrincipal)}</span></span>
+                            </div>
+                        </div>
+                        <div className="flex-shrink-0 flex gap-2 mt-2 md:mt-0">
+                            <button onClick={() => onLoad(item.id)} className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-1 px-3 rounded text-sm transition">
+                                Charger
+                            </button>
+                            <button onClick={() => onDelete(item.id)} className="bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-3 rounded text-sm transition">
+                                Supprimer
+                            </button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// --- components/ResultsDisplay.js ---
+const ResultsDisplay = ({ result, onSave }) => {
+    const [saveName, setSaveName] = useState(`Calcul du ${new Intl.DateTimeFormat('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }).format(new Date())}`);
+    const { steps, initialPrincipal, totalInterest, finalPrincipal, inputs } = result;
+    const tva = totalInterest * 0.18;
+    const totalTTC = totalInterest + tva;
+    const formatCurrency = (value) => new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'XOF' }).format(value);
+    const formatPercent = (value) => new Intl.NumberFormat('fr-FR', { style: 'percent', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+    const formatDate = (dateString) => new Intl.DateTimeFormat('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${dateString}T00:00:00Z`));
+    const chartData = [
+        { name: formatDate(inputs.calculationStartDate), capital: initialPrincipal },
+        ...steps.map(step => ({
+            name: formatDate(step.periodEnd),
+            capital: step.principalStart + step.interest
+        }))
+    ];
+    const handleExportPDF = () => {
+        const element = document.getElementById('pdf-content');
+        const opt = { margin: [10, 10, 10, 10], filename: `decompte-${inputs.pieceNumber.replace(/\//g, '-')}.pdf`, image: { type: 'jpeg', quality: 0.98 }, html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }, pagebreak: { mode: ['css', 'legacy'] } };
+        html2pdf().from(element).set(opt).save();
+    };
+    const handleSaveSubmit = (e) => {
+        e.preventDefault();
+        if (saveName.trim()) {
+            onSave(saveName.trim());
+            alert("Calcul sauvegardé !");
+        }
+    };
+    return (
+        <div className="bg-white p-4 sm:p-6 rounded-xl shadow-lg animate-fade-in">
+            <div id="report-container">
+                <div className="no-export text-center mb-8">
+                    <h2 className="text-2xl font-bold text-brand-dark underline decoration-brand-secondary decoration-4 underline-offset-8">DECOMPTE D'INERÊTS DE DROIT</h2>
+                    <div className="mt-8 grid grid-cols-1 md:grid-cols-2 gap-4 text-left">
+                        <div><strong className="text-brand-primary">Pièce N°:</strong> {inputs.pieceTitle} {inputs.pieceNumber}</div>
+                        <div><strong className="text-brand-primary">du:</strong> {formatDate(inputs.pieceDate)}</div>
+                        <div><strong className="text-brand-primary">A l'encontre de:</strong> {inputs.debtor}</div>
+                        <div><strong className="text-brand-primary">En faveur de:</strong> {inputs.creditor}</div>
+                    </div>
+                    <div className="mt-6">
+                        <p className="text-lg text-gray-600">Principal de</p>
+                        <p className="text-6xl font-extrabold text-brand-primary tracking-tight">{formatCurrency(initialPrincipal)}</p>
+                        <p className="text-lg text-gray-600 mt-2">Arrêté au <strong className="text-brand-primary">{formatDate(inputs.calculationEndDate)}</strong></p>
+                    </div>
+                </div>
+                <div id="pdf-content">
+                    <h3 className="text-xl font-bold text-center mb-4">Détail du Calcul des Intérêts</h3>
+                    <div className="overflow-x-auto"><table className="min-w-full text-sm border border-gray-300"><thead className="bg-gray-100"><tr><th className="p-2 border">Période</th><th className="p-2 border">Jours</th><th className="p-2 border">Taux</th><th className="p-2 border">Principal Début</th><th className="p-2 border">Formule de Calcul</th><th className="p-2 border">Intérêts</th></tr></thead>
+                        <tbody>
+                            {steps.map((step, index) => (
+                                <tr key={index} className="border-b hover:bg-brand-light">
+                                    <td className="p-2 border text-center whitespace-nowrap">Du {formatDate(step.periodStart)}<br/>au {formatDate(step.periodEnd)}</td>
+                                    <td className="p-2 border text-center">{step.days}</td><td className="p-2 border text-center font-semibold">{formatPercent(step.rate)}</td>
+                                    <td className="p-2 border text-right">{formatCurrency(step.principalStart)}</td>
+                                    <td className="p-2 border text-center font-mono"><div className="flex flex-col items-center justify-center"><span>{formatCurrency(step.principalStart).replace(/\s/g, '')} x {formatPercent(step.rate)} x {step.days}</span><span className="border-t-2 border-gray-800 w-full my-1"></span><span>365.25</span></div></td>
+                                    <td className="p-2 border text-right font-semibold text-green-700">{formatCurrency(step.interest)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table></div>
+                    <div className="mt-8 flex justify-end"><div className="w-full md:w-1/2 lg:w-2/5"><h4 className="text-lg font-bold text-brand-dark mb-2">Résumé Financier</h4><div className="space-y-2 text-gray-700 border p-4 rounded-lg"><div className="flex justify-between"><span>Total Intérêts (HT):</span><span className="font-bold">{formatCurrency(totalInterest)}</span></div><div className="flex justify-between"><span>TVA (18%):</span><span>{formatCurrency(tva)}</span></div><hr className="my-2"/><div className="flex justify-between text-xl font-bold text-brand-primary"><span>Total TTC des Intérêts:</span><span>{formatCurrency(totalTTC)}</span></div></div></div></div>
+                </div>
+            </div>
+            <div className="mt-10 pt-6 border-t-2 border-dashed no-export">
+                <h3 className="text-2xl font-bold text-brand-dark mb-6">Analyse et Actions</h3>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                     <div className="bg-brand-light p-6 rounded-lg shadow"><h4 className="text-lg font-semibold text-brand-dark">Montant Final</h4><p className="text-4xl font-bold text-brand-dark mt-2">{formatCurrency(finalPrincipal)}</p></div>
+                     <div className="bg-green-100 p-6 rounded-lg shadow"><h4 className="text-lg font-semibold text-green-800">Intérêts (TTC)</h4><p className="text-4xl font-bold text-green-800 mt-2">{formatCurrency(totalTTC)}</p></div>
+                     <button onClick={handleExportPDF} className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md transition h-full text-2xl">Exporter en PDF</button>
+                </div>
+                <div className="mb-8">
+                    <h4 className="text-xl font-semibold text-brand-dark mb-4">Évolution du Capital</h4>
+                    <div className="w-full h-80 bg-gray-50 p-4 rounded-lg">
+                        <ResponsiveContainer width="100%" height="100%"><LineChart data={chartData} margin={{ top: 5, right: 20, left: 40, bottom: 5 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="name" angle={-20} textAnchor="end" height={60} tick={{fontSize: 12}} /><YAxis tickFormatter={(value) => new Intl.NumberFormat('fr-FR', {notation: 'compact', compactDisplay: 'short'}).format(value)} /><Tooltip formatter={(value) => formatCurrency(value)} /><Legend /><Line type="monotone" dataKey="capital" stroke="#1e40af" strokeWidth={2} dot={{ r: 4 }} activeDot={{ r: 8 }} name="Capital" /></LineChart></ResponsiveContainer>
+                    </div>
+                </div>
+                <div>
+                    <h4 className="text-xl font-semibold text-brand-dark mb-4">Enregistrer ce calcul</h4>
+                    <form onSubmit={handleSaveSubmit} className="flex items-center gap-4 bg-gray-50 p-4 rounded-lg">
+                        <input type="text" value={saveName} onChange={(e) => setSaveName(e.target.value)} placeholder="Nom du calcul" className="flex-grow p-2 border rounded-md shadow-sm" required />
+                        <button type="submit" className="bg-brand-secondary hover:bg-brand-primary text-white font-bold py-2 px-4 rounded-md transition">Enregistrer</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- App.js ---
+const App = () => {
+    const [inputs, setInputs] = useState({
+        pieceTitle: 'Ordonnance exécutoire N°', pieceNumber: '109/01', pieceDate: '2001-02-26',
+        principal: 996670, debtor: 'BEN AYED FATHI ET MEUBLES DE CARTHAGE A.V. FAIDHERBE',
+        calculationStartDate: '1994-03-07', creditor: 'C.F.I Km10 Annis Bassit',
+        legalMention: "(Aux termes du COCC-le taux d'intérêt est majoré de moitié -taux aggravés +2%.)",
+        calculationEndDate: '2010-12-31',
+    });
+    const [result, setResult] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [history, setHistory] = useState([]);
+    useEffect(() => { try { const savedHistory = localStorage.getItem('interestCalculationHistory'); if (savedHistory) { setHistory(JSON.parse(savedHistory)); } } catch (e) { console.error("Erreur:", e); setHistory([]); } }, []);
+    const handleInputChange = (e) => {
+        const { name, value, type } = e.target;
+        const isNumber = type === 'number';
+        setInputs(prev => ({ ...prev, [name]: isNumber && value !== '' ? Number(value) : value, }));
+    };
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        setIsLoading(true);
+        setError(null);
+        setResult(null);
+        setTimeout(() => {
+            try {
+                const calculationResult = calculateCompoundInterest(inputs);
+                setResult(calculationResult);
+            } catch (err) {
+                if (err instanceof Error) {
+                    setError(err.message);
+                } else {
+                    setError("Une erreur inattendue est survenue.");
+                }
+            } finally {
+                setIsLoading(false);
+            }
+        }, 500);
+    };
+    const updateHistory = (newHistory) => { setHistory(newHistory); localStorage.setItem('interestCalculationHistory', JSON.stringify(newHistory)); };
+    const handleSaveToHistory = (name) => { if (!result) return; const newEntry = { id: new Date().toISOString(), name, savedAt: new Date().toISOString(), calculation: result, }; updateHistory([newEntry, ...history]); };
+    const handleLoadFromHistory = (id) => { const saved = history.find(item => item.id === id); if (saved) { setInputs(saved.calculation.inputs); setResult(saved.calculation); window.scrollTo(0, 0); } };
+    const handleDeleteFromHistory = (id) => { if (window.confirm("Êtes-vous sûr de vouloir supprimer cet élément ?")) { const newHistory = history.filter(item => item.id !== id); updateHistory(newHistory); } };
+    return (
+        <React.StrictMode>
+            <div className="min-h-screen bg-gray-50 font-sans text-gray-800">
+                <header className="bg-brand-dark shadow-md no-export"><div className="container mx-auto px-4 py-4"><h1 className="text-3xl font-bold text-white">Calculateur d'Intérêts Composés Juridiques</h1></div></header>
+                <main className="container mx-auto p-4 md:p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div className="lg:col-span-1 bg-white p-6 rounded-xl shadow-lg no-export">
+                        <h2 className="text-2xl font-bold text-brand-dark mb-6 border-b-2 border-brand-secondary pb-2">Informations du décompte</h2>
+                        <form onSubmit={handleSubmit} className="space-y-4">
+                            <div><label htmlFor="pieceTitle" className="block text-sm font-medium text-gray-700">Titre de la pièce</label><select id="pieceTitle" name="pieceTitle" value={inputs.pieceTitle} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"><option>Ordonnance exécutoire N°</option><option>Jugement N°</option><option>Arrêt N°</option></select></div>
+                            <div><label htmlFor="pieceNumber" className="block text-sm font-medium text-gray-700">N°</label><input type="text" id="pieceNumber" name="pieceNumber" value={inputs.pieceNumber} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"/></div>
+                            <div><label htmlFor="pieceDate" className="block text-sm font-medium text-gray-700">du (Date de la pièce)</label><input type="date" id="pieceDate" name="pieceDate" value={inputs.pieceDate} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"/></div>
+                            <div><label htmlFor="principal" className="block text-sm font-medium text-gray-700">Principal</label><div className="mt-1 flex items-center"><input type="number" id="principal" name="principal" value={inputs.principal} onChange={handleInputChange} className="block w-full p-2 border rounded-md shadow-sm" step="any"/><span className="ml-2 text-gray-500 whitespace-nowrap">F CFA</span><span className="ml-2 text-xs text-gray-400">(H.T.V.A)</span></div></div>
+                            <div><label htmlFor="debtor" className="block text-sm font-medium text-gray-700">A l'encontre de</label><input type="text" id="debtor" name="debtor" value={inputs.debtor} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"/></div>
+                            <div><label htmlFor="calculationStartDate" className="block text-sm font-medium text-gray-700">à partir du (Date de début du calcul)</label><input type="date" id="calculationStartDate" name="calculationStartDate" value={inputs.calculationStartDate} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"/></div>
+                            <div><label htmlFor="creditor" className="block text-sm font-medium text-gray-700">En faveur de</label><select id="creditor" name="creditor" value={inputs.creditor} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"><option>C.F.I Km10 Annis Bassit</option><option>Autre créancier</option></select></div>
+                            <div><label htmlFor="legalMention" className="block text-sm font-medium text-gray-700">Mention Légale</label><textarea id="legalMention" name="legalMention" value={inputs.legalMention} onChange={handleInputChange} rows={3} className="mt-1 block w-full p-2 border rounded-md shadow-sm"></textarea></div>
+                            <div><label htmlFor="calculationEndDate" className="block text-sm font-medium text-gray-700">Date de fin du décompte</label><input type="date" id="calculationEndDate" name="calculationEndDate" value={inputs.calculationEndDate} onChange={handleInputChange} className="mt-1 block w-full p-2 border rounded-md shadow-sm"/></div>
+                            <button type="submit" disabled={isLoading} className="w-full bg-brand-primary hover:bg-brand-dark text-white font-bold py-3 px-4 rounded-md transition disabled:bg-gray-400 flex items-center justify-center">{isLoading ? (<> <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Calcul en cours...</>) : "Calculer"}</button>
+                        </form>
+                    </div>
+                    <div className="lg:col-span-2">{error && (<div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-md shadow-md mb-6" role="alert"><p className="font-bold">Erreur</p><p>{error}</p></div>)}{result ? (<ResultsDisplay result={result} onSave={handleSaveToHistory} />) : (<div className="bg-white p-6 rounded-xl shadow-lg h-full flex flex-col items-center justify-center text-center"><svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 text-gray-300 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="linejoin" strokeWidth="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 14h.01M9 11h6m-3-4h.01M12 4h.01M4 7h16a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V8a1 1 0 011-1z" /></svg><h3 className="text-xl font-semibold text-gray-600">En attente de calcul</h3><p className="text-gray-500 mt-2">Veuillez remplir le formulaire et cliquer sur "Calculer".</p></div>)}</div>
+                </main>
+                <section className="container mx-auto px-4 md:px-8 mt-8 no-export"><History history={history} onLoad={handleLoadFromHistory} onDelete={handleDeleteFromHistory} /></section>
+            </div>
+        </React.StrictMode>
+    );
+};
+
+// --- index.js ---
+const container = document.getElementById('root');
+if (container) {
+    const root = createRoot(container);
+    root.render(<App />);
+}
+
+// --- BUNDLE END ---
+    </script>
+</body>
+</html>
